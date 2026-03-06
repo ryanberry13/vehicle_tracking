@@ -1,0 +1,5 @@
+rm -f ~/vehicle_tracking/src/px4_msgs/msg/*.msg
+rm -f ~/vehicle_tracking/src/px4_msgs/srv/*.srv
+cp ~/PX4-Autopilot/msg/*.msg ~/vehicle_tracking/src/px4_msgs/msg/
+cp ~/PX4-Autopilot/msg/versioned/*.msg ~/vehicle_tracking/src/px4_msgs/msg/
+cp ~/PX4-Autopilot/srv/*.srv ~/vehicle_tracking/src/px4_msgs/srv/
