@@ -29,14 +29,16 @@ public:
 
 
     // Subscribers
+    auto px4_qos = rclcpp::QoS(rclcpp::KeepLast(10));
+    px4_qos.best_effort();
     gv_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       "/gv/odom", 10, std::bind(&PathGeneration::gvOdomCallback, this, std::placeholders::_1));
     gv_navsat_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
       "/gv/navsat", 10, std::bind(&PathGeneration::gvNavSatCallback, this, std::placeholders::_1));
     plane_global_pos_sub_ = create_subscription<px4_msgs::msg::VehicleGlobalPosition>(
-      "/plane/global_position", 10, std::bind(&PathGeneration::planeGlobalPositionCallback, this, std::placeholders::_1));
+      "/fmu/out/vehicle_global_position", px4_qos, std::bind(&PathGeneration::planeGlobalPositionCallback, this, std::placeholders::_1));
     plane_local_pos_sub_ = create_subscription<px4_msgs::msg::VehicleLocalPosition>(
-      "/plane/local_position", 10, std::bind(&PathGeneration::planeLocalPositionCallback, this, std::placeholders::_1));
+      "/fmu/out/vehicle_local_position_v1", px4_qos, std::bind(&PathGeneration::planeLocalPositionCallback, this, std::placeholders::_1));
     // Publishers
     lookahead_navsat_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/path/lookahead_navsat", 10);
 

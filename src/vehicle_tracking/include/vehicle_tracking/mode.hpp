@@ -25,8 +25,11 @@ class VehicleTracking : public px4_ros2::ModeBase {
 
     lookahead_sub_ = node_.create_subscription<sensor_msgs::msg::NavSatFix>(
       "/path/lookahead_navsat", 10, std::bind(&VehicleTracking::lookaheadCallback, this, std::placeholders::_1));
+    auto px4_qos = rclcpp::QoS(rclcpp::KeepLast(10));
+    px4_qos.best_effort();
     plane_global_pos_sub_ = node_.create_subscription<px4_msgs::msg::VehicleGlobalPosition>(
-      "/plane/global_position", 10, std::bind(&VehicleTracking::planeGlobalPositionCallback, this, std::placeholders::_1));
+      "/fmu/out/vehicle_global_position", px4_qos,
+      std::bind(&VehicleTracking::planeGlobalPositionCallback, this, std::placeholders::_1));
   }
 
   void onActivate() override {}
