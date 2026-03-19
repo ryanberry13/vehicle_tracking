@@ -1,16 +1,23 @@
 #include <chrono>
 #include <cmath>
 #include <string>
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
 
 #include <GeographicLib/LocalCartesian.hpp>
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <std_msgs/msg/float64.hpp>
 
 #include <vehicle_tracking/path_math.hpp>
 #include <px4_msgs/msg/vehicle_global_position.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
+#ifdef VEHICLE_TRACKING_HAS_FOXGLOVE_MSGS
+#include <foxglove_msgs/msg/geo_json.hpp>
+#endif
 
 using namespace std::chrono_literals;
 
@@ -26,6 +33,13 @@ public:
     period_s_ = declare_parameter<double>("period_s", period_s_);
     cruise_speed_mps_ = declare_parameter<double>("cruise_speed_mps", cruise_speed_mps_);
     lookahead_dist_m_ = declare_parameter<double>("lookahead_dist_m", lookahead_dist_m_);
+    lookahead_integration_dx_m_ = declare_parameter<double>("lookahead_integration_dx_m", lookahead_integration_dx_m_);
+    sine_geojson_half_span_m_ = declare_parameter<double>("sine_geojson_half_span_m", sine_geojson_half_span_m_);
+    sine_geojson_step_m_ = declare_parameter<double>("sine_geojson_step_m", sine_geojson_step_m_);
+    amplitude_scale_deadband_m_ = declare_parameter<double>("amplitude_scale_deadband_m", amplitude_scale_deadband_m_);
+    amplitude_scale_double_at_m_ = declare_parameter<double>("amplitude_scale_double_at_m", amplitude_scale_double_at_m_);
+    amplitude_scale_cap_at_m_ = declare_parameter<double>("amplitude_scale_cap_at_m", amplitude_scale_cap_at_m_);
+    amplitude_scale_cap_factor_ = declare_parameter<double>("amplitude_scale_cap_factor", amplitude_scale_cap_factor_);
 
 
     // Subscribers
@@ -41,6 +55,15 @@ public:
       "/fmu/out/vehicle_local_position_v1", px4_qos, std::bind(&PathGeneration::planeLocalPositionCallback, this, std::placeholders::_1));
     // Publishers
     lookahead_navsat_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/path/lookahead_navsat", 10);
+    plane_navsat_debug_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/path/debug/plane_navsat", 10);
+    base_amplitude_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/base_amplitude_m", 10);
+    scaled_amplitude_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/scaled_amplitude_m", 10);
+    gv_local_x_error_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/gv_local_x_error_m", 10);
+    gv_local_y_error_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/gv_local_y_error_m", 10);
+    phase_deg_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/phase_estimate_deg", 10);
+#ifdef VEHICLE_TRACKING_HAS_FOXGLOVE_MSGS
+    sine_wave_geojson_pub_ = create_publisher<foxglove_msgs::msg::GeoJSON>("/path/debug/sine_wave_geojson", 10);
+#endif
 
     // Timer to update path at specified rate (independent of incoming vehicle updates)
     setTimerFromRate(rate_hz_);
@@ -48,6 +71,148 @@ public:
   }
   
 private:
+    Vec2 advanceAlongSineByArcLength(
+      double x0,
+      double amplitude_m,
+      double wavenumber_rad_m,
+      double phase_rad,
+      double lookahead_arc_m,
+      double dx_m) const
+    {
+      const double q = std::max(0.0, lookahead_arc_m);
+      const double dx = std::max(1e-3, dx_m);
+      double x = x0;
+      double y = amplitude_m * std::sin(wavenumber_rad_m * x + phase_rad);
+
+      if (q <= 1e-6) {
+        return {x, y};
+      }
+
+      double s = 0.0;
+      const int kMaxSteps = 200000;
+      for (int i = 0; i < kMaxSteps; ++i) {
+        const double x_next = x + dx;
+        const double y_next = amplitude_m * std::sin(wavenumber_rad_m * x_next + phase_rad);
+        const double ds = std::hypot(x_next - x, y_next - y);
+
+        if (s + ds >= q && ds > 1e-9) {
+          const double segment_fraction = (q - s) / ds;
+          const double x_interp = x + (x_next - x) * segment_fraction;
+          const double y_interp = y + (y_next - y) * segment_fraction;
+          return {x_interp, y_interp};
+        }
+
+        s += ds;
+        x = x_next;
+        y = y_next;
+      }
+
+      return {x, y};
+    }
+
+    double amplitudeScaleFromAlongTrackError(double along_track_error_m) const
+    {
+      const double deadband = std::max(0.0, amplitude_scale_deadband_m_);
+      const double double_at = std::max(deadband + 1e-3, amplitude_scale_double_at_m_);
+      const double cap_at = std::max(double_at + 1e-3, amplitude_scale_cap_at_m_);
+      const double cap_factor = std::max(2.0, amplitude_scale_cap_factor_);
+
+      const double abs_err = std::abs(along_track_error_m);
+      const bool ahead = along_track_error_m >= 0.0;
+
+      if (abs_err <= deadband) {
+        return 1.0;
+      }
+
+      if (abs_err <= double_at) {
+        const double u = (abs_err - deadband) / (double_at - deadband);
+        return ahead ? (1.0 + u) : (1.0 - 0.5 * u);  // 1->2 (ahead), 1->0.5 (behind)
+      }
+
+      const double u = std::clamp((abs_err - double_at) / (cap_at - double_at), 0.0, 1.0);
+      return ahead
+        ? (2.0 + (cap_factor - 2.0) * u)
+        : (0.5 + ((1.0 / cap_factor) - 0.5) * u);
+    }
+
+    void publishSineWaveGeoJson(
+      const GvFrame& gv_frame,
+      const Vec2& plane_pos_local,
+      const Vec2& lookahead_local,
+      double amplitude_m,
+      double wavenumber_rad_m,
+      double phase_offset_rad)
+    {
+#ifdef VEHICLE_TRACKING_HAS_FOXGLOVE_MSGS
+      if (!sine_wave_geojson_pub_) {
+        return;
+      }
+
+      const double half_span = std::max(20.0, sine_geojson_half_span_m_);
+      const double sample_step = std::max(0.5, sine_geojson_step_m_);
+      const double x_start = plane_pos_local.x - half_span;
+      const double x_end = plane_pos_local.x + half_span;
+
+      std::ostringstream json;
+      json << std::fixed << std::setprecision(7);
+      json << "{\"type\":\"FeatureCollection\",\"features\":[";
+      json << "{\"type\":\"Feature\",\"properties\":{";
+      json << "\"name\":\"desired_sine_path\",";
+      json << "\"amplitude_m\":" << amplitude_m << ",";
+      json << "\"wavenumber_rad_m\":" << wavenumber_rad_m << ",";
+      json << "\"phase_rad\":" << phase_offset_rad;
+      json << "},\"geometry\":{\"type\":\"LineString\",\"coordinates\":[";
+
+      bool first_point = true;
+      for (double x = x_start; x <= x_end + 1e-9; x += sample_step) {
+        const double y = amplitude_m * std::sin(wavenumber_rad_m * x + phase_offset_rad);
+        const Vec2 p_global = gvLocalToGlobal({x, y}, gv_frame);
+
+        double lat = 0.0;
+        double lon = 0.0;
+        double alt = 0.0;
+        local_cart_.Reverse(p_global.x, p_global.y, 0.0, lat, lon, alt);
+        (void)alt;
+
+        if (!first_point) {
+          json << ",";
+        }
+        first_point = false;
+        json << "[" << lon << "," << lat << "]";
+      }
+
+      const Vec2 lookahead_global = gvLocalToGlobal(lookahead_local, gv_frame);
+      double lookahead_lat = 0.0;
+      double lookahead_lon = 0.0;
+      double lookahead_alt = 0.0;
+      local_cart_.Reverse(
+        lookahead_global.x,
+        lookahead_global.y,
+        0.0,
+        lookahead_lat,
+        lookahead_lon,
+        lookahead_alt);
+      (void)lookahead_alt;
+
+      json << "]}},";
+      json << "{\"type\":\"Feature\",\"properties\":{\"name\":\"lookahead_point\"},";
+      json << "\"geometry\":{\"type\":\"Point\",\"coordinates\":[";
+      json << lookahead_lon << "," << lookahead_lat;
+      json << "]}}]}";
+
+      foxglove_msgs::msg::GeoJSON msg{};
+      msg.geojson = json.str();
+      sine_wave_geojson_pub_->publish(msg);
+#else
+      (void)gv_frame;
+      (void)plane_pos_local;
+      (void)lookahead_local;
+      (void)amplitude_m;
+      (void)wavenumber_rad_m;
+      (void)phase_offset_rad;
+#endif
+    }
+
     void setTimerFromRate(double rate_hz)
     {
       const double safe_rate = std::max(1e-3, rate_hz);
@@ -84,8 +249,18 @@ private:
         const double gv_speed_safe_mps = std::max(1e-3, ground_vehicle_state_.speed);
         const double spatial_wavelength_m = gv_speed_safe_mps * period_s_;
         const double spatial_angular_freq_rad_m = 2.0 * M_PI / spatial_wavelength_m;
-        double amplitude_m = generatePathAmplitude(ground_vehicle_state_.speed, cruise_speed_mps_, period_s_);
-        RCLCPP_INFO(get_logger(), "Generated path amplitude: %.2f m", amplitude_m);
+        const double base_amplitude_m = generatePathAmplitude(ground_vehicle_state_.speed, cruise_speed_mps_, period_s_);
+        const double amplitude_scale = amplitudeScaleFromAlongTrackError(plane_pos_local.x);
+        // const double amplitude_m = base_amplitude_m * amplitude_scale;
+        const double amplitude_m = base_amplitude_m;
+      
+        RCLCPP_INFO(
+          get_logger(),
+          "Generated path amplitude: base=%.2f m scale=%.2f result=%.2f m (x_err=%.2f m)",
+          base_amplitude_m,
+          amplitude_scale,
+          amplitude_m,
+          plane_pos_local.x);
     
         // Spatial sine wave e = A*sin(k * s + phi0)
         // where s is along-track distance, A is amplitude, k is spatial angular frequency, e is lateral offset, phi is phase offset
@@ -138,10 +313,41 @@ private:
         prev_phase_offset_rad_ = phase_offset_rad;
         have_prev_phase_ = true;
 
-        const double lookahead_x_local_m = plane_pos_local.x + lookahead_dist_m_;
-        const double lookahead_y_local_m = amplitude_m * std::sin(
-          spatial_angular_freq_rad_m * lookahead_x_local_m + phase_offset_rad);
-        const Vec2 lookahead_local(lookahead_x_local_m, lookahead_y_local_m);
+        std_msgs::msg::Float64 base_amp_msg{};
+        base_amp_msg.data = base_amplitude_m;
+        base_amplitude_debug_pub_->publish(base_amp_msg);
+
+        std_msgs::msg::Float64 scaled_amp_msg{};
+        scaled_amp_msg.data = amplitude_m;
+        scaled_amplitude_debug_pub_->publish(scaled_amp_msg);
+
+        std_msgs::msg::Float64 x_err_msg{};
+        x_err_msg.data = plane_pos_local.x;
+        gv_local_x_error_debug_pub_->publish(x_err_msg);
+
+        std_msgs::msg::Float64 y_err_msg{};
+        y_err_msg.data = plane_pos_local.y;
+        gv_local_y_error_debug_pub_->publish(y_err_msg);
+
+        const double phase_deg = radToDeg(phase_offset_rad);
+        std_msgs::msg::Float64 phase_deg_msg{};
+        phase_deg_msg.data = phase_deg;
+        phase_deg_debug_pub_->publish(phase_deg_msg);
+
+        const Vec2 lookahead_local = advanceAlongSineByArcLength(
+          plane_pos_local.x,
+          amplitude_m,
+          spatial_angular_freq_rad_m,
+          phase_offset_rad,
+          lookahead_dist_m_,
+          lookahead_integration_dx_m_);
+        publishSineWaveGeoJson(
+          gv_frame,
+          plane_pos_local,
+          lookahead_local,
+          amplitude_m,
+          spatial_angular_freq_rad_m,
+          phase_offset_rad);
         const Vec2 lookahead_global = gvLocalToGlobal(lookahead_local, gv_frame);
 
         double lookahead_lat = 0.0;
@@ -169,7 +375,7 @@ private:
         RCLCPP_INFO(
           get_logger(),
           "Phase estimate: %.1f deg (y=%.2f m, vy_local=%.2f m/s, A=%.2f m)",
-          radToDeg(phase_offset_rad),
+          phase_deg,
           plane_pos_local.y,
           plane_vy_local_mps,
           amplitude_m);
@@ -219,6 +425,17 @@ private:
         plane_state_.latitude = global_pos.lat;
         plane_state_.longitude = global_pos.lon;
         plane_state_.altitude = global_pos.alt;
+
+        sensor_msgs::msg::NavSatFix plane_fix{};
+        plane_fix.header.stamp = now();
+        plane_fix.header.frame_id = "plane_global_position";
+        plane_fix.status.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
+        plane_fix.status.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
+        plane_fix.latitude = plane_state_.latitude;
+        plane_fix.longitude = plane_state_.longitude;
+        plane_fix.altitude = plane_state_.altitude;
+        plane_fix.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
+        plane_navsat_debug_pub_->publish(plane_fix);
       }
 
     void planeLocalPositionCallback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg){
@@ -252,6 +469,15 @@ private:
     rclcpp::Subscription<px4_msgs::msg::VehicleGlobalPosition>::SharedPtr plane_global_pos_sub_;
     rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr plane_local_pos_sub_;
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr lookahead_navsat_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr plane_navsat_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr base_amplitude_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr scaled_amplitude_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gv_local_x_error_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gv_local_y_error_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr phase_deg_debug_pub_;
+#ifdef VEHICLE_TRACKING_HAS_FOXGLOVE_MSGS
+    rclcpp::Publisher<foxglove_msgs::msg::GeoJSON>::SharedPtr sine_wave_geojson_pub_;
+#endif
 
     // Timer
     rclcpp::TimerBase::SharedPtr timer_;
@@ -261,6 +487,13 @@ private:
     double period_s_{10.0};
     double cruise_speed_mps_{20.0};
     double lookahead_dist_m_{30.0};
+    double lookahead_integration_dx_m_{0.5};
+    double sine_geojson_half_span_m_{200.0};
+    double sine_geojson_step_m_{5.0};
+    double amplitude_scale_deadband_m_{5.0};
+    double amplitude_scale_double_at_m_{15.0};
+    double amplitude_scale_cap_at_m_{40.0};
+    double amplitude_scale_cap_factor_{4.0};
     double gv_lat_origin_{0.0};
     double gv_lon_origin_{0.0};
     double lead_dist_m_{0.0};

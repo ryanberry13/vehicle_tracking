@@ -16,6 +16,7 @@
   <depend>sensor_msgs</depend>
   <depend>geographiclib</depend>
   <depend>px4_msgs</depend>
+  <depend>foxglove_msgs</depend>
 
 
   <test_depend>ament_lint_auto</test_depend>

@@ -14,6 +14,7 @@ find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(px4_msgs REQUIRED)
+find_package(foxglove_msgs REQUIRED)
 list(APPEND CMAKE_MODULE_PATH "/usr/share/cmake/geographiclib")
 find_package(GeographicLib REQUIRED)
 
@@ -35,7 +36,8 @@ target_include_directories(simulated_vehicle_node PRIVATE ${GeographicLib_INCLUD
 target_link_libraries(simulated_vehicle_node ${GeographicLib_LIBRARIES})
 
 add_executable(path_generation_node src/path_generation_node.cpp src/path_math.cpp)
-ament_target_dependencies(path_generation_node rclcpp px4_msgs nav_msgs sensor_msgs geometry_msgs px4_ros2_cpp)
+ament_target_dependencies(path_generation_node rclcpp px4_msgs nav_msgs sensor_msgs std_msgs geometry_msgs foxglove_msgs px4_ros2_cpp)
+target_compile_definitions(path_generation_node PRIVATE VEHICLE_TRACKING_HAS_FOXGLOVE_MSGS=1)
 
 target_include_directories(path_generation_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

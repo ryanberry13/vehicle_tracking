@@ -1,3 +1,18 @@
 PX4 V1.17 Beta
 
 
+
+#ROS NODES
+ros2 run vehicle_tracking path_generation_node
+ros2 run vehicle_tracking vehicle_tracking_node
+ros2 run vehicle_tracking simulated_vehicle_node --ros-args -p path_mode:=3
+
+#PX4 SITL
+source ~/vehicle_tracking/px4_sitl_setup.bash
+HEADLESS=1 make px4_sitl gz_rc_cessna
+
+MicroXRCEAgent udp4 -p 8888
+
+#FOXGLOVE BRIDGE
+source vehicle_tracking/install/setup.bash
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml
