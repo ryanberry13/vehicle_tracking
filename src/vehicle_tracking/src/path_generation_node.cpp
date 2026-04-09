@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <algorithm>
 #include <iomanip>
@@ -36,6 +37,7 @@ public:
     lookahead_integration_dx_m_ = declare_parameter<double>("lookahead_integration_dx_m", lookahead_integration_dx_m_);
     sine_geojson_half_span_m_ = declare_parameter<double>("sine_geojson_half_span_m", sine_geojson_half_span_m_);
     sine_geojson_step_m_ = declare_parameter<double>("sine_geojson_step_m", sine_geojson_step_m_);
+    target_state_reset_dist_m_ = declare_parameter<double>("target_state_reset_dist_m", target_state_reset_dist_m_);
 
 
     // Subscribers
@@ -56,6 +58,12 @@ public:
     gv_local_x_error_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/gv_local_x_error_m", 10);
     gv_local_y_error_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/gv_local_y_error_m", 10);
     phase_deg_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/phase_estimate_deg", 10);
+    target_local_x_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/target_local_x_m", 10);
+    target_local_y_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/target_local_y_m", 10);
+    target_phase_deg_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/target_phase_deg", 10);
+    target_x_rel_dot_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/target_x_rel_dot_mps", 10);
+    target_xt_dot_abs_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/target_xt_dot_abs_mps", 10);
+    target_yt_dot_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/target_yt_dot_mps", 10);
 #ifdef VEHICLE_TRACKING_HAS_FOXGLOVE_MSGS
     sine_wave_geojson_pub_ = create_publisher<foxglove_msgs::msg::GeoJSON>("/path/debug/sine_wave_geojson", 10);
 #endif
@@ -193,6 +201,30 @@ private:
     }
 
     void updatePath(){
+        if (!have_gv_fix_ || !have_gv_odom_ || !have_plane_global_ || !have_plane_local_) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            2000,
+            "Waiting for required inputs (gv_fix=%d gv_odom=%d plane_global=%d plane_local=%d)",
+            have_gv_fix_,
+            have_gv_odom_,
+            have_plane_global_,
+            have_plane_local_);
+          return;
+        }
+
+        const int64_t now_ns = now().nanoseconds();
+        double dt_s = 0.0;
+        if (have_prev_target_time_) {
+          const int64_t dt_ns = now_ns - prev_target_time_ns_;
+          if (dt_ns > 0) {
+            dt_s = static_cast<double>(dt_ns) * 1e-9;
+          }
+        }
+        prev_target_time_ns_ = now_ns;
+        have_prev_target_time_ = true;
+
         double gv_x, gv_y, gv_z;
         local_cart_.Forward(ground_vehicle_state_.latitude, ground_vehicle_state_.longitude, 0.0, gv_x, gv_y, gv_z);
         RCLCPP_INFO(get_logger(), "GV local position ENU: x=%.2f m, y=%.2f m", gv_x, gv_y);
@@ -238,8 +270,8 @@ private:
           return w;
         };
 
-        // Solve phase at current position: phi = k*x + phase_offset, with y = A*sin(phi).
-        const auto solve_phase_at_position = [&]() {
+        // Solve phase at current aircraft position from y=A*sin(phi).
+        const auto solve_phase_at_position = [&](double prev_phase_rad, bool have_prev_phase) {
           const double y = plane_pos_local.y;
 
           if (std::abs(y) >= amplitude_m) {
@@ -253,12 +285,12 @@ private:
           const double phi_2 = wrap_0_2pi(theta_2);
 
           if (std::abs(plane_vy_local_mps) < 1e-3) {
-            if (have_prev_phase_at_position_) {
+            if (have_prev_phase) {
               const auto angle_distance = [](double a, double b) {
                 const double d = std::abs(a - b);
                 return std::min(d, 2.0 * M_PI - d);
               };
-              return (angle_distance(phi_1, prev_phase_at_position_rad_) <= angle_distance(phi_2, prev_phase_at_position_rad_))
+              return (angle_distance(phi_1, prev_phase_rad) <= angle_distance(phi_2, prev_phase_rad))
                 ? phi_1
                 : phi_2;
             }
@@ -270,27 +302,79 @@ private:
         };
 
         double phase_at_position_rad = 0.0;
-        double phase_offset_rad = 0.0;
         if (amplitude_m > 1e-6) {
-          phase_at_position_rad = solve_phase_at_position();
-          phase_offset_rad =
-            wrap_0_2pi(phase_at_position_rad - spatial_angular_freq_rad_m * plane_pos_local.x);
-          phase_offset_rad = wrap_0_2pi(phase_offset_rad);
+          phase_at_position_rad = solve_phase_at_position(prev_phase_at_position_rad_, have_prev_phase_at_position_);
         }
 
         prev_phase_at_position_rad_ = phase_at_position_rad;
         have_prev_phase_at_position_ = true;
+
+        if (have_target_state_) {
+          const double target_err_x = target_pos_local_.x - plane_pos_local.x;
+          if (!std::isfinite(target_pos_local_.x) ||
+              !std::isfinite(target_pos_local_.y) ||
+              std::abs(target_err_x) > target_state_reset_dist_m_) {
+            RCLCPP_WARN(
+              get_logger(),
+              "Resetting target state (target_local_x=%.2f plane_local_x=%.2f).",
+              target_pos_local_.x,
+              plane_pos_local.x);
+            have_target_state_ = false;
+            have_prev_target_time_ = false;
+            dt_s = 0.0;
+          }
+        }
+
+        if (!have_target_state_) {
+          if (!did_startup_anchor_init_) {
+            // One-time startup anchor: target begins exactly at GV frame origin.
+            target_pos_local_ = {0.0, 0.0};
+            target_phase_rad_ = 0.0;
+            did_startup_anchor_init_ = true;
+          } else {
+            // Subsequent safety resets reinitialize near current aircraft position.
+            target_pos_local_ = plane_pos_local;
+            target_phase_rad_ = (amplitude_m > 1e-6) ? phase_at_position_rad : 0.0;
+          }
+          have_target_state_ = true;
+        } else if (dt_s > 1e-6) {
+          const double dt_limited_s = std::min(dt_s, 1.0);
+          const double a_prime = spatial_angular_freq_rad_m * amplitude_m;
+          const double yprime = a_prime * std::cos(target_phase_rad_);
+          const double xt_dot_abs_mps =
+            std::max(0.0, cruise_speed_mps_) / std::sqrt(1.0 + yprime * yprime);
+          const double x_rel_dot_mps = xt_dot_abs_mps - ground_vehicle_state_.speed;
+          const double yt_dot_mps = yprime * xt_dot_abs_mps;
+
+          target_pos_local_.x += x_rel_dot_mps * dt_limited_s;
+          target_pos_local_.y += yt_dot_mps * dt_limited_s;
+          target_phase_rad_ = wrap_0_2pi(
+            target_phase_rad_ + spatial_angular_freq_rad_m * xt_dot_abs_mps * dt_limited_s);
+        }
+
+        const Vec2 target_local = target_pos_local_;
+        const Vec2 target_global = gvLocalToGlobal(target_local, gv_frame);
+        const double phase_offset_rad =
+          wrap_0_2pi(target_phase_rad_ - spatial_angular_freq_rad_m * target_local.x);
+
+        // Recompute target rates for debug from the current target phase.
+        const double a_prime_dbg = spatial_angular_freq_rad_m * amplitude_m;
+        const double yprime_dbg = a_prime_dbg * std::cos(target_phase_rad_);
+        const double xt_dot_abs_dbg_mps =
+          std::max(0.0, cruise_speed_mps_) / std::sqrt(1.0 + yprime_dbg * yprime_dbg);
+        const double x_rel_dot_dbg_mps = xt_dot_abs_dbg_mps - ground_vehicle_state_.speed;
+        const double yt_dot_dbg_mps = yprime_dbg * xt_dot_abs_dbg_mps;
 
         std_msgs::msg::Float64 base_amp_msg{};
         base_amp_msg.data = amplitude_m;
         base_amplitude_debug_pub_->publish(base_amp_msg);
 
         std_msgs::msg::Float64 x_err_msg{};
-        x_err_msg.data = plane_pos_local.x;
+        x_err_msg.data = plane_pos_local.x - target_local.x;
         gv_local_x_error_debug_pub_->publish(x_err_msg);
 
         std_msgs::msg::Float64 y_err_msg{};
-        y_err_msg.data = plane_pos_local.y;
+        y_err_msg.data = plane_pos_local.y - target_local.y;
         gv_local_y_error_debug_pub_->publish(y_err_msg);
 
         const double phase_deg = radToDeg(wrap_0_2pi(phase_at_position_rad));
@@ -298,28 +382,44 @@ private:
         phase_deg_msg.data = phase_deg;
         phase_deg_debug_pub_->publish(phase_deg_msg);
 
-        const Vec2 lookahead_local = advanceAlongSineByArcLength(
-          plane_pos_local.x,
-          amplitude_m,
-          spatial_angular_freq_rad_m,
-          phase_offset_rad,
-          lookahead_dist_m_,
-          lookahead_integration_dx_m_);
+        std_msgs::msg::Float64 target_x_msg{};
+        target_x_msg.data = target_local.x;
+        target_local_x_debug_pub_->publish(target_x_msg);
+
+        std_msgs::msg::Float64 target_y_msg{};
+        target_y_msg.data = target_local.y;
+        target_local_y_debug_pub_->publish(target_y_msg);
+
+        std_msgs::msg::Float64 target_phase_msg{};
+        target_phase_msg.data = radToDeg(target_phase_rad_);
+        target_phase_deg_debug_pub_->publish(target_phase_msg);
+
+        std_msgs::msg::Float64 target_x_rel_dot_msg{};
+        target_x_rel_dot_msg.data = x_rel_dot_dbg_mps;
+        target_x_rel_dot_debug_pub_->publish(target_x_rel_dot_msg);
+
+        std_msgs::msg::Float64 target_xt_abs_msg{};
+        target_xt_abs_msg.data = xt_dot_abs_dbg_mps;
+        target_xt_dot_abs_debug_pub_->publish(target_xt_abs_msg);
+
+        std_msgs::msg::Float64 target_yt_dot_msg{};
+        target_yt_dot_msg.data = yt_dot_dbg_mps;
+        target_yt_dot_debug_pub_->publish(target_yt_dot_msg);
+
         publishSineWaveGeoJson(
           gv_frame,
           plane_pos_local,
-          lookahead_local,
+          target_local,
           amplitude_m,
           spatial_angular_freq_rad_m,
           phase_offset_rad);
-        const Vec2 lookahead_global = gvLocalToGlobal(lookahead_local, gv_frame);
 
         double lookahead_lat = 0.0;
         double lookahead_lon = 0.0;
         double lookahead_alt = 0.0;
         local_cart_.Reverse(
-          lookahead_global.x,
-          lookahead_global.y,
+          target_global.x,
+          target_global.y,
           0.0,
           lookahead_lat,
           lookahead_lon,
@@ -345,11 +445,11 @@ private:
           amplitude_m);
         RCLCPP_INFO(
           get_logger(),
-          "Lookahead point: local(x=%.2f, y=%.2f) globalENU(x=%.2f, y=%.2f) lat=%.7f lon=%.7f",
-          lookahead_local.x,
-          lookahead_local.y,
-          lookahead_global.x,
-          lookahead_global.y,
+          "Target point: local(x=%.2f, y=%.2f) globalENU(x=%.2f, y=%.2f) lat=%.7f lon=%.7f",
+          target_local.x,
+          target_local.y,
+          target_global.x,
+          target_global.y,
           lookahead_lat,
           lookahead_lon);
 
@@ -362,6 +462,7 @@ private:
         ground_vehicle_state_.speed = std::hypot(odom.twist.twist.linear.x, odom.twist.twist.linear.y); 
         geometry_msgs::msg::Quaternion q = odom.pose.pose.orientation;
         ground_vehicle_state_.heading = quatToYaw(q); // radians
+        have_gv_odom_ = true;
         // RCLCPP_INFO(get_logger(), "GV heading: %.2f deg", ground_vehicle_state_.heading);
     }
 
@@ -374,9 +475,14 @@ private:
               gv_lon_origin_ = fix.longitude;
               RCLCPP_INFO(get_logger(), "Set GV origin to lat: %.6f deg, lon: %.6f deg", gv_lat_origin_, gv_lon_origin_);
               local_cart_.Reset(gv_lat_origin_, gv_lon_origin_);
+              have_target_state_ = false;
+              have_prev_target_time_ = false;
+              have_prev_phase_at_position_ = false;
+              did_startup_anchor_init_ = false;
           }
           ground_vehicle_state_.latitude = fix.latitude;
           ground_vehicle_state_.longitude = fix.longitude;
+          have_gv_fix_ = true;
         }
         else{
           RCLCPP_WARN(get_logger(), "No GPS fix available, skipping update...");
@@ -389,6 +495,7 @@ private:
         plane_state_.latitude = global_pos.lat;
         plane_state_.longitude = global_pos.lon;
         plane_state_.altitude = global_pos.alt;
+        have_plane_global_ = true;
 
         sensor_msgs::msg::NavSatFix plane_fix{};
         plane_fix.header.stamp = now();
@@ -408,6 +515,7 @@ private:
         plane_state_.groundspeed = std::hypot(local_pos.vx, local_pos.vy);
         plane_state_.cog = std::atan2(local_pos.vy, local_pos.vx); // radians
         plane_state_.heading = local_pos.heading; //radians
+        have_plane_local_ = true;
     }
 
     struct GroundVehicleState {
@@ -438,6 +546,12 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gv_local_x_error_debug_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gv_local_y_error_debug_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr phase_deg_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr target_local_x_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr target_local_y_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr target_phase_deg_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr target_x_rel_dot_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr target_xt_dot_abs_debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr target_yt_dot_debug_pub_;
 #ifdef VEHICLE_TRACKING_HAS_FOXGLOVE_MSGS
     rclcpp::Publisher<foxglove_msgs::msg::GeoJSON>::SharedPtr sine_wave_geojson_pub_;
 #endif
@@ -456,6 +570,17 @@ private:
     double gv_lat_origin_{0.0};
     double gv_lon_origin_{0.0};
     double lead_dist_m_{0.0};
+    double target_state_reset_dist_m_{1000.0};
+    bool have_gv_fix_{false};
+    bool have_gv_odom_{false};
+    bool have_plane_global_{false};
+    bool have_plane_local_{false};
+    bool have_prev_target_time_{false};
+    int64_t prev_target_time_ns_{0};
+    bool have_target_state_{false};
+    Vec2 target_pos_local_{0.0, 0.0};
+    double target_phase_rad_{0.0};
+    bool did_startup_anchor_init_{false};
     bool have_prev_phase_at_position_{false};
     double prev_phase_at_position_rad_{0.0};
 
