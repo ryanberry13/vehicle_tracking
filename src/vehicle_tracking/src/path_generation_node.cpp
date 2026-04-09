@@ -36,10 +36,6 @@ public:
     lookahead_integration_dx_m_ = declare_parameter<double>("lookahead_integration_dx_m", lookahead_integration_dx_m_);
     sine_geojson_half_span_m_ = declare_parameter<double>("sine_geojson_half_span_m", sine_geojson_half_span_m_);
     sine_geojson_step_m_ = declare_parameter<double>("sine_geojson_step_m", sine_geojson_step_m_);
-    amplitude_scale_deadband_m_ = declare_parameter<double>("amplitude_scale_deadband_m", amplitude_scale_deadband_m_);
-    amplitude_scale_double_at_m_ = declare_parameter<double>("amplitude_scale_double_at_m", amplitude_scale_double_at_m_);
-    amplitude_scale_cap_at_m_ = declare_parameter<double>("amplitude_scale_cap_at_m", amplitude_scale_cap_at_m_);
-    amplitude_scale_cap_factor_ = declare_parameter<double>("amplitude_scale_cap_factor", amplitude_scale_cap_factor_);
 
 
     // Subscribers
@@ -57,7 +53,6 @@ public:
     lookahead_navsat_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/path/lookahead_navsat", 10);
     plane_navsat_debug_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/path/debug/plane_navsat", 10);
     base_amplitude_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/base_amplitude_m", 10);
-    scaled_amplitude_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/scaled_amplitude_m", 10);
     gv_local_x_error_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/gv_local_x_error_m", 10);
     gv_local_y_error_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/gv_local_y_error_m", 10);
     phase_deg_debug_pub_ = create_publisher<std_msgs::msg::Float64>("/path/debug/phase_estimate_deg", 10);
@@ -108,31 +103,6 @@ private:
       }
 
       return {x, y};
-    }
-
-    double amplitudeScaleFromAlongTrackError(double along_track_error_m) const
-    {
-      const double deadband = std::max(0.0, amplitude_scale_deadband_m_);
-      const double double_at = std::max(deadband + 1e-3, amplitude_scale_double_at_m_);
-      const double cap_at = std::max(double_at + 1e-3, amplitude_scale_cap_at_m_);
-      const double cap_factor = std::max(2.0, amplitude_scale_cap_factor_);
-
-      const double abs_err = std::abs(along_track_error_m);
-      const bool ahead = along_track_error_m >= 0.0;
-
-      if (abs_err <= deadband) {
-        return 1.0;
-      }
-
-      if (abs_err <= double_at) {
-        const double u = (abs_err - deadband) / (double_at - deadband);
-        return ahead ? (1.0 + u) : (1.0 - 0.5 * u);  // 1->2 (ahead), 1->0.5 (behind)
-      }
-
-      const double u = std::clamp((abs_err - double_at) / (cap_at - double_at), 0.0, 1.0);
-      return ahead
-        ? (2.0 + (cap_factor - 2.0) * u)
-        : (0.5 + ((1.0 / cap_factor) - 0.5) * u);
     }
 
     void publishSineWaveGeoJson(
@@ -249,77 +219,71 @@ private:
         const double gv_speed_safe_mps = std::max(1e-3, ground_vehicle_state_.speed);
         const double spatial_wavelength_m = gv_speed_safe_mps * period_s_;
         const double spatial_angular_freq_rad_m = 2.0 * M_PI / spatial_wavelength_m;
-        const double base_amplitude_m = generatePathAmplitude(ground_vehicle_state_.speed, cruise_speed_mps_, period_s_);
-        const double amplitude_scale = amplitudeScaleFromAlongTrackError(plane_pos_local.x);
-        // const double amplitude_m = base_amplitude_m * amplitude_scale;
-        const double amplitude_m = base_amplitude_m;
+        const double amplitude_m = generatePathAmplitude(ground_vehicle_state_.speed, cruise_speed_mps_, period_s_);
       
         RCLCPP_INFO(
           get_logger(),
-          "Generated path amplitude: base=%.2f m scale=%.2f result=%.2f m (x_err=%.2f m)",
-          base_amplitude_m,
-          amplitude_scale,
+          "Generated path amplitude: %.2f m (x_err=%.2f m)",
           amplitude_m,
           plane_pos_local.x);
     
         // Spatial sine wave e = A*sin(k * s + phi0)
         // where s is along-track distance, A is amplitude, k is spatial angular frequency, e is lateral offset, phi is phase offset
 
-        // Solve phase so y_plane = A*sin(k*x_plane + phase) while using lateral velocity sign to
-        // disambiguate branch and clamping to 90/270 deg when |y| >= A.
-        double phase_offset_rad = 0.0;
-        if (amplitude_m > 1e-6) {
+        const auto wrap_0_2pi = [](double a) {
+          double w = std::fmod(a, 2.0 * M_PI);
+          if (w < 0.0) {
+            w += 2.0 * M_PI;
+          }
+          return w;
+        };
+
+        // Solve phase at current position: phi = k*x + phase_offset, with y = A*sin(phi).
+        const auto solve_phase_at_position = [&]() {
           const double y = plane_pos_local.y;
-          const double x = plane_pos_local.x;
-          const auto wrap_0_2pi = [](double a) {
-            double w = std::fmod(a, 2.0 * M_PI);
-            if (w < 0.0) {
-              w += 2.0 * M_PI;
-            }
-            return w;
-          };
 
           if (std::abs(y) >= amplitude_m) {
-            phase_offset_rad = (y >= 0.0) ? (M_PI / 2.0) : (3.0 * M_PI / 2.0);
-          } else {
-            const double sin_arg = y / amplitude_m;
-            const double theta_1 = std::asin(sin_arg);
-            const double theta_2 = M_PI - theta_1;
-            const double phase_1 = wrap_0_2pi(theta_1 - spatial_angular_freq_rad_m * x);
-            const double phase_2 = wrap_0_2pi(theta_2 - spatial_angular_freq_rad_m * x);
-
-            if (std::abs(plane_vy_local_mps) < 1e-3) {
-              if (have_prev_phase_) {
-                const auto angle_distance = [&](double a, double b) {
-                  const double d = std::abs(a - b);
-                  return std::min(d, 2.0 * M_PI - d);
-                };
-                phase_offset_rad =
-                  (angle_distance(phase_1, prev_phase_offset_rad_) <= angle_distance(phase_2, prev_phase_offset_rad_))
-                    ? phase_1
-                    : phase_2;
-              } else {
-                phase_offset_rad = phase_1;
-              }
-            } else {
-              const double velocity_sign = (plane_vy_local_mps >= 0.0) ? 1.0 : -1.0;
-              phase_offset_rad = (std::cos(theta_1) * velocity_sign >= 0.0) ? phase_1 : phase_2;
-            }
+            return (y >= 0.0) ? (100.0 * M_PI / 180.0) : (290.0 * M_PI / 180.0);
           }
 
+          const double sin_arg = y / amplitude_m;
+          const double theta_1 = std::asin(sin_arg);
+          const double theta_2 = M_PI - theta_1;
+          const double phi_1 = wrap_0_2pi(theta_1);
+          const double phi_2 = wrap_0_2pi(theta_2);
+
+          if (std::abs(plane_vy_local_mps) < 1e-3) {
+            if (have_prev_phase_at_position_) {
+              const auto angle_distance = [](double a, double b) {
+                const double d = std::abs(a - b);
+                return std::min(d, 2.0 * M_PI - d);
+              };
+              return (angle_distance(phi_1, prev_phase_at_position_rad_) <= angle_distance(phi_2, prev_phase_at_position_rad_))
+                ? phi_1
+                : phi_2;
+            }
+            return phi_1;
+          }
+
+          const double velocity_sign = (plane_vy_local_mps >= 0.0) ? 1.0 : -1.0;
+          return (std::cos(theta_1) * velocity_sign >= 0.0) ? phi_1 : phi_2;
+        };
+
+        double phase_at_position_rad = 0.0;
+        double phase_offset_rad = 0.0;
+        if (amplitude_m > 1e-6) {
+          phase_at_position_rad = solve_phase_at_position();
+          phase_offset_rad =
+            wrap_0_2pi(phase_at_position_rad - spatial_angular_freq_rad_m * plane_pos_local.x);
           phase_offset_rad = wrap_0_2pi(phase_offset_rad);
         }
 
-        prev_phase_offset_rad_ = phase_offset_rad;
-        have_prev_phase_ = true;
+        prev_phase_at_position_rad_ = phase_at_position_rad;
+        have_prev_phase_at_position_ = true;
 
         std_msgs::msg::Float64 base_amp_msg{};
-        base_amp_msg.data = base_amplitude_m;
+        base_amp_msg.data = amplitude_m;
         base_amplitude_debug_pub_->publish(base_amp_msg);
-
-        std_msgs::msg::Float64 scaled_amp_msg{};
-        scaled_amp_msg.data = amplitude_m;
-        scaled_amplitude_debug_pub_->publish(scaled_amp_msg);
 
         std_msgs::msg::Float64 x_err_msg{};
         x_err_msg.data = plane_pos_local.x;
@@ -329,7 +293,7 @@ private:
         y_err_msg.data = plane_pos_local.y;
         gv_local_y_error_debug_pub_->publish(y_err_msg);
 
-        const double phase_deg = radToDeg(phase_offset_rad);
+        const double phase_deg = radToDeg(wrap_0_2pi(phase_at_position_rad));
         std_msgs::msg::Float64 phase_deg_msg{};
         phase_deg_msg.data = phase_deg;
         phase_deg_debug_pub_->publish(phase_deg_msg);
@@ -471,7 +435,6 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr lookahead_navsat_pub_;
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr plane_navsat_debug_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr base_amplitude_debug_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr scaled_amplitude_debug_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gv_local_x_error_debug_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gv_local_y_error_debug_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr phase_deg_debug_pub_;
@@ -481,24 +444,20 @@ private:
 
     // Timer
     rclcpp::TimerBase::SharedPtr timer_;
-    double rate_hz_{5.0};
+    double rate_hz_{20.0};
 
 
-    double period_s_{10.0};
-    double cruise_speed_mps_{20.0};
-    double lookahead_dist_m_{30.0};
+    double period_s_{50.0};
+    double cruise_speed_mps_{15.0};
+    double lookahead_dist_m_{10.0};
     double lookahead_integration_dx_m_{0.5};
     double sine_geojson_half_span_m_{200.0};
     double sine_geojson_step_m_{5.0};
-    double amplitude_scale_deadband_m_{5.0};
-    double amplitude_scale_double_at_m_{15.0};
-    double amplitude_scale_cap_at_m_{40.0};
-    double amplitude_scale_cap_factor_{4.0};
     double gv_lat_origin_{0.0};
     double gv_lon_origin_{0.0};
     double lead_dist_m_{0.0};
-    bool have_prev_phase_{false};
-    double prev_phase_offset_rad_{0.0};
+    bool have_prev_phase_at_position_{false};
+    double prev_phase_at_position_rad_{0.0};
 
     GeographicLib::LocalCartesian local_cart_;
 
