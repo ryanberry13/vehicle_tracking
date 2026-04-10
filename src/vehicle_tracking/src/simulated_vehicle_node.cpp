@@ -9,7 +9,7 @@
 //
 // path_mode options:
 //   1: straight, constant speed
-//   2: straight, variable speed profile (after 20s)
+//   2: straight, variable speed profile (minute-scale timing)
 //   3: constant speed, gentle alternating curvature (after 20s)
 //   4: variable speed + gentle alternating curvature
 //
@@ -93,19 +93,23 @@ private:
     }
 
     // Modes 2 and 4: speed schedule with holds and ramps.
-    if (t_since_start_s < 20.0) {
+    // Mode 2 uses much longer (minute-scale) timing.
+    const bool minute_scale = (mode == 2);
+    const double startup_delay_s = 20.0;
+    const double ramp_up_first_s = 20.0;
+    const double hold_high_s = minute_scale ? 180.0 : 15.0;
+    const double ramp_down_s = 20.0;
+    const double hold_low_s = minute_scale ? 180.0 : 15.0;
+    const double ramp_up_s = 20.0;
+
+    if (t_since_start_s < startup_delay_s) {
       return base;
     }
 
     const double v_high = 8.0;
     const double v_low = 3.0;
-    const double ramp_up_first_s = 20.0;
-    const double hold_high_s = 15.0;
-    const double ramp_down_s = 20.0;
-    const double hold_low_s = 15.0;
-    const double ramp_up_s = 20.0;
 
-    double tau = t_since_start_s - 20.0;
+    double tau = t_since_start_s - startup_delay_s;
     if (tau < ramp_up_first_s) {
       return lerp(base, v_high, tau / ramp_up_first_s);
     }
@@ -206,6 +210,27 @@ private:
 
     const double yaw_rate_rad_s = yawRateProfileRadS(mode, t_since_start_s);
     const double v = speedProfileMps(mode, t_since_start_s, speed_mps_);
+    const double dv = v - prev_commanded_speed_mps_;
+    constexpr double kSpeedChangeEps = 1e-3;
+    int speed_trend = 0;  // 1: speeding up, -1: slowing down, 0: steady
+    if (dv > kSpeedChangeEps) {
+      speed_trend = 1;
+    } else if (dv < -kSpeedChangeEps) {
+      speed_trend = -1;
+    }
+
+    if (!have_prev_commanded_speed_ || speed_trend != last_speed_trend_) {
+      if (speed_trend == 1) {
+        RCLCPP_INFO(get_logger(), "Speed profile: speeding up (mode=%d, v=%.2f m/s)", mode, v);
+      } else if (speed_trend == -1) {
+        RCLCPP_INFO(get_logger(), "Speed profile: slowing down (mode=%d, v=%.2f m/s)", mode, v);
+      } else {
+        RCLCPP_INFO(get_logger(), "Speed profile: holding speed (mode=%d, v=%.2f m/s)", mode, v);
+      }
+      last_speed_trend_ = speed_trend;
+    }
+    prev_commanded_speed_mps_ = v;
+    have_prev_commanded_speed_ = true;
 
     // Modes 1/2 keep configured heading; modes 3/4 integrate yaw rate.
     if (mode == 1 || mode == 2) {
@@ -288,6 +313,9 @@ private:
   double rate_hz_{5.0};
   int64_t path_mode_{1};
   int last_path_mode_{-1};
+  bool have_prev_commanded_speed_{false};
+  double prev_commanded_speed_mps_{0.0};
+  int last_speed_trend_{0};
 
   double origin_lat_deg_{0.0};
   double origin_lon_deg_{0.0};

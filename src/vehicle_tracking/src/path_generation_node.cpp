@@ -1,7 +1,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <string>
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
@@ -20,9 +19,6 @@
 #include <foxglove_msgs/msg/geo_json.hpp>
 #endif
 
-using namespace std::chrono_literals;
-
-
 class PathGeneration : public rclcpp::Node
 {
 public:
@@ -33,8 +29,6 @@ public:
     rate_hz_ = declare_parameter<double>("rate_hz", rate_hz_);
     period_s_ = declare_parameter<double>("period_s", period_s_);
     cruise_speed_mps_ = declare_parameter<double>("cruise_speed_mps", cruise_speed_mps_);
-    lookahead_dist_m_ = declare_parameter<double>("lookahead_dist_m", lookahead_dist_m_);
-    lookahead_integration_dx_m_ = declare_parameter<double>("lookahead_integration_dx_m", lookahead_integration_dx_m_);
     sine_geojson_half_span_m_ = declare_parameter<double>("sine_geojson_half_span_m", sine_geojson_half_span_m_);
     sine_geojson_step_m_ = declare_parameter<double>("sine_geojson_step_m", sine_geojson_step_m_);
     target_state_reset_dist_m_ = declare_parameter<double>("target_state_reset_dist_m", target_state_reset_dist_m_);
@@ -74,45 +68,6 @@ public:
   }
   
 private:
-    Vec2 advanceAlongSineByArcLength(
-      double x0,
-      double amplitude_m,
-      double wavenumber_rad_m,
-      double phase_rad,
-      double lookahead_arc_m,
-      double dx_m) const
-    {
-      const double q = std::max(0.0, lookahead_arc_m);
-      const double dx = std::max(1e-3, dx_m);
-      double x = x0;
-      double y = amplitude_m * std::sin(wavenumber_rad_m * x + phase_rad);
-
-      if (q <= 1e-6) {
-        return {x, y};
-      }
-
-      double s = 0.0;
-      const int kMaxSteps = 200000;
-      for (int i = 0; i < kMaxSteps; ++i) {
-        const double x_next = x + dx;
-        const double y_next = amplitude_m * std::sin(wavenumber_rad_m * x_next + phase_rad);
-        const double ds = std::hypot(x_next - x, y_next - y);
-
-        if (s + ds >= q && ds > 1e-9) {
-          const double segment_fraction = (q - s) / ds;
-          const double x_interp = x + (x_next - x) * segment_fraction;
-          const double y_interp = y + (y_next - y) * segment_fraction;
-          return {x_interp, y_interp};
-        }
-
-        s += ds;
-        x = x_next;
-        y = y_next;
-      }
-
-      return {x, y};
-    }
-
     void publishSineWaveGeoJson(
       const GvFrame& gv_frame,
       const Vec2& plane_pos_local,
@@ -514,7 +469,6 @@ private:
         const auto& local_pos = *msg;
         plane_state_.groundspeed = std::hypot(local_pos.vx, local_pos.vy);
         plane_state_.cog = std::atan2(local_pos.vy, local_pos.vx); // radians
-        plane_state_.heading = local_pos.heading; //radians
         have_plane_local_ = true;
     }
 
@@ -531,8 +485,6 @@ private:
       double altitude;
       double groundspeed;
       double cog;
-      double airspeed;
-      double heading;
     } plane_state_;
 
     // Subscribers
@@ -563,8 +515,6 @@ private:
 
     double period_s_{50.0};
     double cruise_speed_mps_{15.0};
-    double lookahead_dist_m_{10.0};
-    double lookahead_integration_dx_m_{0.5};
     double sine_geojson_half_span_m_{200.0};
     double sine_geojson_step_m_{5.0};
     double gv_lat_origin_{0.0};
