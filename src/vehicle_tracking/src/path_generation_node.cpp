@@ -27,7 +27,7 @@ public:
   {
     // Parameters
     rate_hz_ = declare_parameter<double>("rate_hz", rate_hz_);
-    period_s_ = declare_parameter<double>("period_s", period_s_);
+    spatial_wavelength_m_ = declare_parameter<double>("spatial_wavelength_m", spatial_wavelength_m_);
     cruise_speed_mps_ = declare_parameter<double>("cruise_speed_mps", cruise_speed_mps_);
     sine_geojson_half_span_m_ = declare_parameter<double>("sine_geojson_half_span_m", sine_geojson_half_span_m_);
     sine_geojson_step_m_ = declare_parameter<double>("sine_geojson_step_m", sine_geojson_step_m_);
@@ -204,9 +204,11 @@ private:
         const double plane_vy_local_mps = plane_state_.groundspeed * std::sin(rel_course_rad);
 
         const double gv_speed_safe_mps = std::max(1e-3, ground_vehicle_state_.speed);
-        const double spatial_wavelength_m = gv_speed_safe_mps * period_s_;
-        const double spatial_angular_freq_rad_m = 2.0 * M_PI / spatial_wavelength_m;
-        const double amplitude_m = generatePathAmplitude(ground_vehicle_state_.speed, cruise_speed_mps_, period_s_);
+        const double spatial_wavelength_safe_m = std::max(1e-3, spatial_wavelength_m_);
+        const double spatial_angular_freq_rad_m = 2.0 * M_PI / spatial_wavelength_safe_m;
+        const double speed_ratio = std::max(0.0, cruise_speed_mps_) / gv_speed_safe_mps;
+        const double a_prime = solveAmplitude(speed_ratio);
+        const double amplitude_m = (a_prime * spatial_wavelength_safe_m) / (2.0 * M_PI);
       
         RCLCPP_INFO(
           get_logger(),
@@ -513,7 +515,7 @@ private:
     double rate_hz_{20.0};
 
 
-    double period_s_{50.0};
+    double spatial_wavelength_m_{350.0};
     double cruise_speed_mps_{15.0};
     double sine_geojson_half_span_m_{200.0};
     double sine_geojson_step_m_{5.0};

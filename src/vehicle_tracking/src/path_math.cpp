@@ -19,15 +19,6 @@ double radToDeg(double radians) {
     return radians * (180.0 / M_PI);
 }
 
-double generatePathAmplitude(double gv_speed, double plane_speed, double period_s){
-
-    double distance = std::max(1e-5, gv_speed) * period_s;  // Avoid zero speed
-    double speed_ratio = plane_speed / std::max(1e-5, gv_speed);  // Avoid division by zero
-    double a_prime = solveAmplitude(speed_ratio);
-    double amplitude_m = (a_prime * distance) / ( 2.0 * M_PI);  // Example: amplitude scales with distance and speed ratio
-    return amplitude_m;
-}
-
 double solveAmplitude(double speed_ratio){
     if (speed_ratio < 1.0) {
         // throw std::invalid_argument("No real solution: need sigma >= 1 (vP >= vB).");

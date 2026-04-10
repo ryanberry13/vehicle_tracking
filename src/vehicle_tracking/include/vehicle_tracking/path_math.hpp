@@ -4,7 +4,6 @@
 #include <geometry_msgs/msg/quaternion.hpp>
 
 
-double generatePathAmplitude(double gv_speed, double plane_speed, double period_s);
 double solveAmplitude(double speed_ratio);
 double quatToYaw(const geometry_msgs::msg::Quaternion& q);
 double radToDeg(double radians);
