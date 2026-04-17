@@ -205,6 +205,7 @@ private:
 
         const double gv_speed_safe_mps = std::max(1e-3, ground_vehicle_state_.speed);
         const double spatial_wavelength_safe_m = std::max(1e-3, spatial_wavelength_m_);
+        const double effective_period_s = spatial_wavelength_safe_m / gv_speed_safe_mps;
         const double spatial_angular_freq_rad_m = 2.0 * M_PI / spatial_wavelength_safe_m;
         const double speed_ratio = std::max(0.0, cruise_speed_mps_) / gv_speed_safe_mps;
         const double a_prime = solveAmplitude(speed_ratio);
@@ -212,8 +213,9 @@ private:
       
         RCLCPP_INFO(
           get_logger(),
-          "Generated path amplitude: %.2f m (x_err=%.2f m)",
+          "Generated path amplitude: %.2f m, effective period: %.2f s (x_err=%.2f m)",
           amplitude_m,
+          effective_period_s,
           plane_pos_local.x);
     
         // Spatial sine wave e = A*sin(k * s + phi0)
@@ -301,13 +303,14 @@ private:
           const double xt_dot_abs_mps =
             std::max(0.0, cruise_speed_mps_) / std::sqrt(1.0 + yprime * yprime);
           const double x_rel_dot_mps = xt_dot_abs_mps - ground_vehicle_state_.speed;
-          const double yt_dot_mps = yprime * xt_dot_abs_mps;
 
           target_pos_local_.x += x_rel_dot_mps * dt_limited_s;
-          target_pos_local_.y += yt_dot_mps * dt_limited_s;
           target_phase_rad_ = wrap_0_2pi(
             target_phase_rad_ + spatial_angular_freq_rad_m * xt_dot_abs_mps * dt_limited_s);
         }
+
+        // Keep target on the current sine geometry even while A changes with GV speed.
+        target_pos_local_.y = amplitude_m * std::sin(target_phase_rad_);
 
         const Vec2 target_local = target_pos_local_;
         const Vec2 target_global = gvLocalToGlobal(target_local, gv_frame);

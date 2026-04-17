@@ -9,7 +9,7 @@
 //
 // path_mode options:
 //   1: straight, constant speed
-//   2: straight, variable speed profile (minute-scale timing)
+//   2: straight, variable speed profile (3 -> 6 gradual, then quick back to 3)
 //   3: constant speed, gentle alternating curvature (after 20s)
 //   4: variable speed + gentle alternating curvature
 //
@@ -92,26 +92,25 @@ private:
       return base;
     }
 
-    // Modes 2 and 4: speed schedule with holds and ramps.
-    // Mode 2 uses much longer (minute-scale) timing.
+    // Modes 2 and 4: speed schedule is fixed at 3 -> 6 m/s.
+    // "Gradual up, quick down"; mode 2 is slower overall (minute-scale holds).
     const bool minute_scale = (mode == 2);
+    const double v_low = 3.0;
+    const double v_high = 6.0;
     const double startup_delay_s = 20.0;
-    const double ramp_up_first_s = 20.0;
+    const double ramp_up_first_s = minute_scale ? 60.0 : 20.0;
     const double hold_high_s = minute_scale ? 180.0 : 15.0;
-    const double ramp_down_s = 20.0;
+    const double ramp_down_s = minute_scale ? 10.0 : 5.0;
     const double hold_low_s = minute_scale ? 180.0 : 15.0;
-    const double ramp_up_s = 20.0;
+    const double ramp_up_s = minute_scale ? 60.0 : 20.0;
 
     if (t_since_start_s < startup_delay_s) {
-      return base;
+      return v_low;
     }
-
-    const double v_high = 8.0;
-    const double v_low = 3.0;
 
     double tau = t_since_start_s - startup_delay_s;
     if (tau < ramp_up_first_s) {
-      return lerp(base, v_high, tau / ramp_up_first_s);
+      return lerp(v_low, v_high, tau / ramp_up_first_s);
     }
 
     tau -= ramp_up_first_s;
@@ -142,15 +141,27 @@ private:
       return 0.0;
     }
 
-    // Modes 3 and 4: start gentle alternating curvature after 20s.
+    // Modes 3 and 4: start alternating curvature after 20s.
     if (t_since_start_s < 20.0) {
       return 0.0;
     }
 
-    const double curve_rate_rad_s = 2.0 * M_PI / 180.0;  // gentle turn rate
-    const double turn_angle_rad = M_PI / 2.0;            // ~90 deg per turn segment
+    // Mode 3: very gradual and spaced-out turns.
+    // Mode 4: gentler than before.
+    const bool gradual_spaced = (mode == 3);
+    const bool gentler_mode4 = (mode == 4);
+    const double curve_rate_rad_s = gradual_spaced
+      ? (0.5 * M_PI / 180.0)   // very gentle turn rate
+      : (gentler_mode4
+        ? (1.0 * M_PI / 180.0) // gentler mode 4 turn rate
+        : (2.0 * M_PI / 180.0));
+    const double turn_angle_rad = gradual_spaced
+      ? (45.0 * M_PI / 180.0)  // shallower turn segments
+      : (gentler_mode4
+        ? (45.0 * M_PI / 180.0) // gentler mode 4 turn segments
+        : (M_PI / 2.0));        // previous mode 4 angle
     const double curve_duration_s = turn_angle_rad / curve_rate_rad_s;
-    const double straight_duration_s = 20.0;
+    const double straight_duration_s = gradual_spaced ? 120.0 : 20.0;
     const double cycle_s = 2.0 * (curve_duration_s + straight_duration_s);
 
     double phase = std::fmod(t_since_start_s - 20.0, cycle_s);
@@ -308,7 +319,7 @@ private:
   double heading_rad_{0.0};
 
   // Params
-  double speed_mps_{5.0};
+  double speed_mps_{3.0};
   double heading_deg_{0.0};
   double rate_hz_{5.0};
   int64_t path_mode_{1};
